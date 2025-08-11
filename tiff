@@ -1,0 +1,143 @@
+import boto3
+import os
+from datetime import datetime, date, timedelta
+import pyspark.sql.functions as F
+
+"""
+Boto3 Clients
+"""
+s3_client = boto3.resource("s3", region_name="us-east-1")
+
+"""
+Define Environment and Filepaths
+"""
+ENV = os.getenv("ENV", "local").lower().strip()
+if ENV in ("dev", "local"):
+    env = "dev"
+elif ENV == "test":
+    env = "test"
+elif ENV == "prod":
+    env = "prod"
+
+"""
+Define Dates
+Start at the first of this current month and end at today's date
+"""
+dbutils.widgets.text("MONTH_TO_RUN", "%Y-%m")
+month_value = dbutils.widgets.get("MONTH_TO_RUN")
+MONTH_TO_RUN = (
+    # either run for the previous month, or accept a specific month as a parameter
+    date.today().replace(day=1) - timedelta(1) 
+    if month_value == "%Y-%m"
+    else datetime.strptime(month_value, "%Y-%m").date()
+)
+print(f"Running cost for {env} {MONTH_TO_RUN}")
+
+# COMMAND ----------
+
+databricks_dbus = spark.sql(f"""
+               
+SELECT DISTINCT
+  sbu.workspace_id Workspace_ID,
+  sbu.SKU_Name,
+  date_format(sbu.usage_date, 'yyyy-MM-dd') as Usage_Date,
+  SUM(sbu.usage_quantity) as Total_DBUs
+FROM
+  system.billing.usage sbu
+WHERE
+  YEAR(sbu.usage_date) = {MONTH_TO_RUN.year}
+  AND MONTH(sbu.usage_date) = {MONTH_TO_RUN.month}
+group by
+  Workspace_ID,
+  SKU_Name,
+  Usage_Date
+Order by
+  SKU_Name
+
+""")
+
+workspaces = spark.read.table(f"platform.account.workspaces")
+pricing = spark.read.table(f"platform.account.pricing_by_date")
+      
+databricks_dbus_workspaces = (
+  databricks_dbus.join(workspaces, databricks_dbus.Workspace_ID==workspaces.workspace_id)
+  .join(pricing, [databricks_dbus.SKU_Name==pricing.product_code, databricks_dbus.Usage_Date==pricing.price_date])
+  .select(
+    F.regexp_replace(workspaces.workspace_name, r'(\-dev$|\-test$|\-prod$|\-sbx$|\-databricks\-v2$)', '').alias("Platform"),
+    (workspaces.workspace_environment).alias("Environment"),
+    (workspaces.workspace_name).alias("Workspace_Name"),
+    databricks_dbus.Workspace_ID,
+    "SKU_Name",
+    "Usage_Date",
+    "Total_DBUs",
+    (pricing.discount_price).alias("Rate"),
+    (pricing.total_overhead_cost).alias("Fees")
+  )
+  .withColumn("Year", F.year(F.col("Usage_Date")))
+  .withColumn("Month", F.month(F.col("Usage_Date")))
+  .withColumn("DBU_Cost", F.round(F.col("Rate") * F.col("Total_DBUs"), 2))
+  .withColumn("Fees_Cost", F.round(F.col("Fees") * F.col("Total_DBUs"), 2))
+  .withColumn("Total_Cost", F.round((F.col("Rate") + F.col("Fees")) * F.col("Total_DBUs"), 2))
+  .withColumn("Owner_Expense_Center", F.lit("EC.00004854"))
+  .withColumn("App_Cost_Center", F.when(F.col("Platform") == "ma-analytics", "EC.88700009").otherwise("NA"))
+  .drop("Usage_Date")
+)
+
+# COMMAND ----------
+
+databricks_dbus_workspaces_total_cost = databricks_dbus_workspaces.groupby([
+    'Platform',
+    'Environment',
+    'Workspace_Name',
+    'Workspace_ID',
+    'Year',
+    'Month',
+    'SKU_Name',
+    'Owner_Expense_Center',
+    'App_Cost_Center'
+  ]).agg(
+    F.avg('Rate').alias('Rate'), 
+    F.avg('Fees').alias('Fees'), 
+    F.sum('Total_DBUs').alias('Total_DBUs'), 
+    F.sum('DBU_Cost').alias('DBU_Cost'), 
+    F.sum('Fees_Cost').alias('Fees_Cost'), 
+    F.sum('Total_Cost').alias('Total_Cost'))
+
+# COMMAND ----------
+
+"""
+Save to Table and Print CSV to path
+"""
+
+
+(databricks_dbus_workspaces_total_cost.write
+  .mode("overwrite")
+  .option("replaceWhere", f"date_format(usage_date, 'yyyy-MM') == date_format('{MONTH_TO_RUN}', 'yyyy-MM')")
+  .saveAsTable("platform.account.workspace_cost_report")
+)
+
+"""
+Rename generated file
+"""
+usage_output_file_bucket = f"evernorth-us-edp-{env}-finops"
+usage_output_file_prefix = f"gio-apptio/databricks"
+usage_output_file_path = f"s3://{usage_output_file_bucket}/{usage_output_file_prefix}/"
+databricks_dbus_workspaces_total_cost.coalesce(1).write.mode("overwrite").option("header", True).csv(
+    usage_output_file_path + "temp_" + MONTH_TO_RUN.strftime("%m")
+)
+
+"""
+copy old name to new name and delete old object
+"""
+bucket = s3_client.Bucket(usage_output_file_bucket)
+for file in bucket.objects.filter(Prefix=usage_output_file_prefix):
+    src_key = file.key
+    if src_key.endswith(".csv") and "temp" in src_key:
+        dest_key = f"{usage_output_file_prefix}/{MONTH_TO_RUN.strftime('%Y')}/{MONTH_TO_RUN.strftime('%m')}/ISG_Databricks_Workspace_FinOps.csv"
+        copy_source = usage_output_file_bucket + "/" + src_key
+        s3_client.Object(usage_output_file_bucket, dest_key).copy_from(
+            CopySource=copy_source
+        )
+        s3_client.Object(usage_output_file_bucket, src_key).delete()
+    elif "temp" in src_key:
+        s3_client.Object(usage_output_file_bucket, src_key).delete()
