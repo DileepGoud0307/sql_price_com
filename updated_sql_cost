@@ -1,129 +1,88 @@
-CREATE MATERIALIZED VIEW `en_overwatch_dev`.`default`.`all_compute_usage_cost_mv`
-(
-  workspace_name STRING,
-  event_date DATE,
-  job_or_query STRING,
-  sku_name STRING COMMENT 'Name of the SKU',
-  job_id STRING,
-  run_id STRING,
-  statement_id STRING,
-  client_application STRING,
-  dbus_usage DOUBLE,
-  cost_usd DOUBLE,
-  executed_by STRING,
-  job_owner STRING,
-  job_status STRING COMMENT 'The statement termination state. Possible values are:
-    FINISHED: execution was successful
-    FAILED: execution failed with the reason for failure described in the accompanying error message
-    CANCELED: execution was canceled',
-  termination_code STRING,
-  all_computes_job_count BIGINT,
-  job_name STRING,
-  jobs_list ARRAY<STRUCT<job_id: STRING, job_name: STRING>>,
-  cluster_id STRING,
-  cluster_name STRING
-)
-PARTITIONED BY (event_date)
-SCHEDULE EVERY 1 DAYS AS
-WITH workspace_mapping (workspace_id, workspace_name) AS (
-  SELECT * FROM VALUES
-    ('4315244962041036', 'intl-euro-test'),
-    ('2526242183754071', 'intl-euro-dev'),
-    ('903937390948931', 'hs-bdes-test'),
-    ('2527997857503871', 'hs-bdes-dev'),
-    ('5629214838322243', 'hs-bdes-prod'),
-    ('4009948445792575', 'brighter-cigna-databricks-v2'),
-    ('8759791729654491', 'edp-databricks-sbx'),
-    ('515946335708587', 'mlcoe-dbx-dev'),
-    ('5425976998483154', 'mlcoe-dbx-prod'),
-    ('295062747499580', 'hs-poc'),
-    ('922310190196067', 'sae-databricks-prod'),
-    ('495694519135107', 'digexp-databricks-test'),
-    ('2467188453237426', 'mlcoe-dbx-test'),
-    ('234172798029718', 'sae-databricks-dev'),
-    ('149802285607479', 'sae-databricks-test'),
-    ('2648649579811016', 'digexp-databricks-prod'),
-    ('1064652275943973', 'digexp-databricks-dev'),
-    ('6031270147106191', 'edp-databricks-dev'),
-    ('142132121706207', 'edp-databricks-prod'),
-    ('626070532816605', 'edp-databricks-test'),
-    ('4064905682659650', 'ma-analytics-test'),
-    ('3079655437919927', 'ma-analytics-dev'),
-    ('2732863070226768', 'ma-analytics-prod'),
-    ('2156251692687024', 'hs-analytics-platform-dev ')
+CREATE OR REPLACE MATERIALIZED VIEW your_schema.compute_costs_mv
+AS
+WITH
+workspace_mapping AS (
+  SELECT DISTINCT workspace_id, workspace_name
+  FROM platform.account.workspaces
 ),
-user_display_names AS (
-  SELECT id AS identity, display_name FROM platform.identity.users
-),
-sp_display_names AS (
-  SELECT id AS identity, display_name FROM platform.identity.service_principals
-),
+
 clusters AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC) AS rn
+  SELECT DISTINCT workspace_id, cluster_id, cluster_name
   FROM system.compute.clusters
-  WHERE cluster_source IN ('UI', 'API')
-  QUALIFY rn = 1
 ),
-job_tasks_exploded AS (
-  SELECT workspace_id, job_id, EXPLODE(compute_ids) AS cluster_id
-  FROM system.workflow.job_task_run_timeline
-  WHERE period_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
-),
-most_recent_jobs AS (
-  SELECT workspace_id, job_id, name AS job_name, creator_id,
-    ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
-  FROM system.workflow.jobs
-  QUALIFY rn = 1
-),
+
 job_metadata AS (
-  SELECT t1.workspace_id, t1.cluster_id,
-    COUNT(DISTINCT t1.job_id) AS all_computes_job_count,
-    COLLECT_SET(NAMED_STRUCT('job_id', t1.job_id, 'job_name', mj.job_name)) AS jobs_list,
-    MAX(mj.creator_id) AS creator_id
-  FROM job_tasks_exploded t1
-  LEFT JOIN most_recent_jobs mj
-    ON t1.workspace_id = mj.workspace_id AND t1.job_id = mj.job_id
-  GROUP BY t1.workspace_id, t1.cluster_id
-),
-sql_query_costs AS (
   SELECT
-    COALESCE(wm.workspace_name, q.workspace_id) AS workspace_name,
-    DATE(q.end_time) AS event_date,
+    workspace_id,
+    cluster_id,
+    COUNT(DISTINCT job_id) AS all_computes_job_count,
+    COLLECT_LIST(NAMED_STRUCT('job_id', job_id, 'job_name', job_name)) AS jobs_list,
+    FIRST(creator_id, TRUE) AS creator_id
+  FROM system.jobs
+  WHERE start_time >= DATEADD(DAY, -365, CURRENT_DATE)
+  GROUP BY workspace_id, cluster_id
+),
+
+user_display_names AS (
+  SELECT DISTINCT identity, display_name
+  FROM platform.account.users
+),
+
+sp_display_names AS (
+  SELECT DISTINCT application_id AS identity, display_name
+  FROM platform.account.service_principals
+),
+
+-- SQL Warehouse costs
+sql_costs AS (
+  SELECT
+    COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
+    DATE(u.usage_end_time) AS event_date,
     'SQL' AS job_or_query,
     u.sku_name,
     NULL AS job_id,
     NULL AS run_id,
-    q.statement_id,
-    q.client_application,
-    ROUND(q.query_attributed_dbus_estimation, 2) AS dbus_usage,
-    ROUND(q.query_attributed_dbus_estimation * pb.discount_price, 2) AS cost_usd,
-    q.executed_by,
-    q.executed_by AS job_owner,
-    h.execution_status AS job_status,
+    u.usage_metadata.statement_id,
+    u.usage_metadata.client_application,
+    SUM(u.usage_quantity) AS dbus_usage,
+    ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
+    u.usage_metadata.executed_by AS executed_by,
+    COALESCE(
+      FIRST(u_disp.display_name, TRUE),
+      FIRST(sp_disp.display_name, TRUE),
+      '_REDACTED_'
+    ) AS job_owner,
+    NULL AS job_status,
     NULL AS termination_code,
-    1 AS all_computes_job_count,
+    NULL AS all_computes_job_count,
     NULL AS job_name,
-    CAST(NULL AS ARRAY<STRUCT<job_id: STRING, job_name: STRING>>) AS jobs_list,
+    NULL AS jobs_list,
     NULL AS cluster_id,
     NULL AS cluster_name
-  FROM en_overwatch_dev.default.dbsql_cost_per_query q
-  LEFT JOIN (
-    SELECT DISTINCT usage_metadata.warehouse_id, sku_name, DATE(usage_start_time) AS usage_date
-    FROM system.billing.usage
-    WHERE usage_metadata.warehouse_id IS NOT NULL
-  ) u
-    ON q.warehouse_id = u.warehouse_id
-    AND DATE(q.end_time) = u.usage_date
-  LEFT JOIN platform.system_query.history_masked h
-    ON q.statement_id = h.statement_id
-  LEFT JOIN workspace_mapping wm
-    ON q.workspace_id = wm.workspace_id
-  LEFT JOIN platform.account.pricing_by_date pb
-    ON pb.product_code = u.sku_name
-    AND pb.price_date = CURRENT_DATE()
-  WHERE DATE(q.end_time) >= DATEADD(DAY, -365, CURRENT_DATE)
+  FROM system.billing.usage u
+    LEFT JOIN platform.account.pricing_by_date pb
+      ON pb.product_code = u.sku_name
+      AND pb.price_date = CURRENT_DATE()
+    LEFT JOIN workspace_mapping wm
+      ON u.workspace_id = wm.workspace_id
+    LEFT JOIN user_display_names u_disp
+      ON u.usage_metadata.executed_by = u_disp.identity
+    LEFT JOIN sp_display_names sp_disp
+      ON u.usage_metadata.executed_by = sp_disp.identity
+  WHERE
+    u.sku_name LIKE '%SQL_WAREHOUSE%'
+    AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
+    AND u.usage_end_time <= CURRENT_DATE()
+  GROUP BY
+    COALESCE(wm.workspace_name, u.workspace_id),
+    DATE(u.usage_end_time),
+    u.sku_name,
+    u.usage_metadata.statement_id,
+    u.usage_metadata.client_application,
+    u.usage_metadata.executed_by
 ),
+
+-- All Purpose Compute costs
 apc_costs AS (
   SELECT
     COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
@@ -137,7 +96,11 @@ apc_costs AS (
     SUM(u.usage_quantity) AS dbus_usage,
     ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
     NULL AS executed_by,
-    COALESCE(FIRST(u_disp.display_name, TRUE), FIRST(sp_disp.display_name, TRUE), '_REDACTED_') AS job_owner,
+    COALESCE(
+      FIRST(u_disp.display_name, TRUE),
+      FIRST(sp_disp.display_name, TRUE),
+      '_REDACTED_'
+    ) AS job_owner,
     NULL AS job_status,
     NULL AS termination_code,
     COALESCE(j.all_computes_job_count, 0) AS all_computes_job_count,
@@ -146,100 +109,87 @@ apc_costs AS (
     u.usage_metadata.cluster_id AS cluster_id,
     FIRST(c.cluster_name, TRUE) AS cluster_name
   FROM system.billing.usage u
-  LEFT JOIN platform.account.pricing_by_date pb
-    ON pb.product_code = u.sku_name
-    AND pb.price_date = CURRENT_DATE()
-  LEFT JOIN clusters c
-    ON u.workspace_id = c.workspace_id
-    AND u.usage_metadata.cluster_id = c.cluster_id
-  LEFT JOIN job_metadata j
-    ON u.workspace_id = j.workspace_id
-    AND u.usage_metadata.cluster_id = j.cluster_id
-  LEFT JOIN user_display_names u_disp
-    ON j.creator_id = u_disp.identity
-  LEFT JOIN sp_display_names sp_disp
-    ON j.creator_id = sp_disp.identity
-  LEFT JOIN workspace_mapping wm
-    ON u.workspace_id = wm.workspace_id
-  WHERE u.sku_name = 'ENTERPRISE_ALL_PURPOSE_COMPUTE'
+    LEFT JOIN platform.account.pricing_by_date pb
+      ON pb.product_code = u.sku_name
+      AND pb.price_date = CURRENT_DATE()
+    LEFT JOIN clusters c
+      ON u.workspace_id = c.workspace_id
+      AND u.usage_metadata.cluster_id = c.cluster_id
+    LEFT JOIN job_metadata j
+      ON u.workspace_id = j.workspace_id
+      AND u.usage_metadata.cluster_id = j.cluster_id
+    LEFT JOIN user_display_names u_disp
+      ON j.creator_id = u_disp.identity
+    LEFT JOIN sp_display_names sp_disp
+      ON j.creator_id = sp_disp.identity
+    LEFT JOIN workspace_mapping wm
+      ON u.workspace_id = wm.workspace_id
+  WHERE
+    u.sku_name LIKE '%ALL_PURPOSE_COMPUTE%'
     AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
     AND u.usage_end_time <= CURRENT_DATE()
     AND u.usage_metadata.cluster_id IS NOT NULL
-  GROUP BY COALESCE(wm.workspace_name, u.workspace_id), DATE(u.usage_end_time),
-           u.usage_metadata.cluster_id, j.all_computes_job_count, j.jobs_list, j.creator_id, u.sku_name
+  GROUP BY
+    COALESCE(wm.workspace_name, u.workspace_id),
+    DATE(u.usage_end_time),
+    u.usage_metadata.cluster_id,
+    j.all_computes_job_count,
+    j.jobs_list,
+    j.creator_id,
+    u.sku_name
 ),
-list_cost_per_job_run AS (
+
+-- Job Compute costs
+job_costs AS (
   SELECT
-    t1.workspace_id,
-    t1.usage_metadata.job_id,
-    t1.usage_metadata.job_run_id AS run_id,
-    ROUND(SUM(t1.usage_quantity * pb.discount_price), 2) AS cost_usd,
-    SUM(t1.usage_quantity) AS dbus_usage,
-    FIRST(identity_metadata.run_as, TRUE) AS executed_by,
-    FIRST(t1.custom_tags, TRUE) AS custom_tags,
-    DATE(MAX(t1.usage_end_time)) AS event_date
-  FROM system.billing.usage t1
-  LEFT JOIN platform.account.pricing_by_date pb
-    ON pb.product_code = t1.sku_name
-    AND pb.price_date = CURRENT_DATE()
-  WHERE t1.billing_origin_product = 'JOBS'
-    AND t1.usage_date >= DATEADD(DAY, -365, CURRENT_DATE)
-  GROUP BY ALL
-),
-most_recent_job_compute AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
-  FROM system.workflow.jobs
-),
-failed_job_runs AS (
-  SELECT workspace_id, job_id, run_id, result_state AS job_status, termination_code
-  FROM system.workflow.job_run_timeline
-  WHERE result_state IS NOT NULL
-),
-job_compute_costs AS (
-  SELECT
-    COALESCE(wm.workspace_name, t1.workspace_id) AS workspace_name,
-    t1.event_date,
+    COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
+    DATE(u.usage_end_time) AS event_date,
     'JOBS' AS job_or_query,
-    pb.product_code AS sku_name,
-    t1.job_id,
-    t1.run_id,
+    u.sku_name,
+    u.usage_metadata.job_id AS job_id,
+    u.usage_metadata.run_id AS run_id,
     NULL AS statement_id,
     NULL AS client_application,
-    t1.dbus_usage,
-    t1.cost_usd,
-    t1.executed_by,
-    COALESCE(u_disp.display_name, sp_disp.display_name, '_REDACTED_') AS job_owner,
-    f.job_status,
-    f.termination_code,
-    1 AS all_computes_job_count,
-    t2.job_name,
-    CAST(NULL AS ARRAY<STRUCT<job_id: STRING, job_name: STRING>>) AS jobs_list,
+    SUM(u.usage_quantity) AS dbus_usage,
+    ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
+    u.usage_metadata.run_as AS executed_by,
+    COALESCE(
+      FIRST(u_disp.display_name, TRUE),
+      FIRST(sp_disp.display_name, TRUE),
+      '_REDACTED_'
+    ) AS job_owner,
+    FIRST(u.usage_metadata.status, TRUE) AS job_status,
+    FIRST(u.usage_metadata.termination_code, TRUE) AS termination_code,
+    NULL AS all_computes_job_count,
+    FIRST(u.usage_metadata.job_name, TRUE) AS job_name,
+    NULL AS jobs_list,
     NULL AS cluster_id,
     NULL AS cluster_name
-  FROM list_cost_per_job_run t1
-  LEFT JOIN platform.account.pricing_by_date pb
-    ON pb.product_code = 'ENTERPRISE_JOB_COMPUTE'
-    AND pb.price_date = CURRENT_DATE()
-  INNER JOIN failed_job_runs f
-    ON t1.workspace_id = f.workspace_id
-    AND t1.job_id = f.job_id
-    AND t1.run_id = f.run_id
-  LEFT JOIN (
-    SELECT * FROM most_recent_jobs WHERE rn = 1
-  ) t2
-    ON t1.workspace_id = t2.workspace_id
-    AND t1.job_id = t2.job_id
-  LEFT JOIN workspace_mapping wm
-    ON t1.workspace_id = wm.workspace_id
-  LEFT JOIN user_display_names u_disp
-    ON t2.creator_id = u_disp.identity
-  LEFT JOIN sp_display_names sp_disp
-    ON t2.creator_id = sp_disp.identity
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY t1.run_id ORDER BY t1.cost_usd DESC) = 1
+  FROM system.billing.usage u
+    LEFT JOIN platform.account.pricing_by_date pb
+      ON pb.product_code = u.sku_name
+      AND pb.price_date = CURRENT_DATE()
+    LEFT JOIN workspace_mapping wm
+      ON u.workspace_id = wm.workspace_id
+    LEFT JOIN user_display_names u_disp
+      ON u.usage_metadata.run_as = u_disp.identity
+    LEFT JOIN sp_display_names sp_disp
+      ON u.usage_metadata.run_as = sp_disp.identity
+  WHERE
+    u.sku_name LIKE '%JOB_COMPUTE%'
+    AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
+    AND u.usage_end_time <= CURRENT_DATE()
+  GROUP BY
+    COALESCE(wm.workspace_name, u.workspace_id),
+    DATE(u.usage_end_time),
+    u.usage_metadata.job_id,
+    u.usage_metadata.run_id,
+    u.usage_metadata.run_as,
+    u.sku_name
 )
-SELECT * FROM sql_query_costs
+
+SELECT * FROM sql_costs
 UNION ALL
 SELECT * FROM apc_costs
 UNION ALL
-SELECT * FROM job_compute_costs;
+SELECT * FROM job_costs;
