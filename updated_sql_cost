@@ -1,195 +1,253 @@
-CREATE OR REPLACE MATERIALIZED VIEW your_schema.compute_costs_mv
-AS
-WITH
-workspace_mapping AS (
-  SELECT DISTINCT workspace_id, workspace_name
-  FROM platform.account.workspaces
-),
-
-clusters AS (
-  SELECT DISTINCT workspace_id, cluster_id, cluster_name
-  FROM system.compute.clusters
-),
-
-job_metadata AS (
+-- create a table of every cluster or warehouse that is created, and who created it
+CREATE OR REPLACE TABLE usm_{{env}}.platform.creation_events AS
+SELECT
+t1.name,
+t1.id,
+t1.type,
+coalesce(t2.user_name, t1.user) user
+FROM (
+  SELECT DISTINCT
+  cluster_name name,
+  concat("cluster-",cluster_id) id,
+  owned_by user,
+  "cluster" as type
+  FROM SYSTEM.COMPUTE.CLUSTERS
+  UNION
   SELECT
-    workspace_id,
-    cluster_id,
-    COUNT(DISTINCT job_id) AS all_computes_job_count,
-    COLLECT_LIST(NAMED_STRUCT('job_id', job_id, 'job_name', job_name)) AS jobs_list,
-    FIRST(creator_id, TRUE) AS creator_id
-  FROM system.jobs
-  WHERE start_time >= DATEADD(DAY, -365, CURRENT_DATE)
-  GROUP BY workspace_id, cluster_id
-),
-
-user_display_names AS (
-  SELECT DISTINCT identity, display_name
-  FROM platform.account.users
-),
-
-sp_display_names AS (
-  SELECT DISTINCT application_id AS identity, display_name
-  FROM platform.account.service_principals
-),
-
--- SQL Warehouse costs
-sql_costs AS (
+  request_params.clusterName name,
+  request_params.clusterOwnerUserId user,
+  concat("cluster-", request_params.clusterId) id,
+  "cluster" as type
+  FROM system.access.audit
+  WHERE service_name = 'clusters'
+  UNION
   SELECT
-    COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
-    DATE(u.usage_end_time) AS event_date,
-    'SQL' AS job_or_query,
-    u.sku_name,
-    NULL AS job_id,
-    NULL AS run_id,
-    u.usage_metadata.statement_id,
-    u.usage_metadata.client_application,
-    SUM(u.usage_quantity) AS dbus_usage,
-    ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
-    u.usage_metadata.executed_by AS executed_by,
-    COALESCE(
-      FIRST(u_disp.display_name, TRUE),
-      FIRST(sp_disp.display_name, TRUE),
-      '_REDACTED_'
-    ) AS job_owner,
-    NULL AS job_status,
-    NULL AS termination_code,
-    NULL AS all_computes_job_count,
-    NULL AS job_name,
-    NULL AS jobs_list,
-    NULL AS cluster_id,
-    NULL AS cluster_name
-  FROM system.billing.usage u
-    LEFT JOIN platform.account.pricing_by_date pb
-      ON pb.product_code = u.sku_name
-      AND pb.price_date = CURRENT_DATE()
-    LEFT JOIN workspace_mapping wm
-      ON u.workspace_id = wm.workspace_id
-    LEFT JOIN user_display_names u_disp
-      ON u.usage_metadata.executed_by = u_disp.identity
-    LEFT JOIN sp_display_names sp_disp
-      ON u.usage_metadata.executed_by = sp_disp.identity
-  WHERE
-    u.sku_name LIKE '%SQL_WAREHOUSE%'
-    AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
-    AND u.usage_end_time <= CURRENT_DATE()
-  GROUP BY
-    COALESCE(wm.workspace_name, u.workspace_id),
-    DATE(u.usage_end_time),
-    u.sku_name,
-    u.usage_metadata.statement_id,
-    u.usage_metadata.client_application,
-    u.usage_metadata.executed_by
-),
+  request_params.name,
+  user_identity.email as user,
+  concat("warehouse-",trim( TRAILING '"}' FROM trim(LEADING '{"id":"' FROM response.result))) id,
+  "warehouse" as type
+  FROM system.access.audit
+  WHERE service_name = 'databrickssql'
+  AND action_name = 'createWarehouse' -- user_identity.email , response.result
+  UNION
+  SELECT *
+  FROM VALUES
+  ('Shared Warehouse Pro' name,'alexander.Metrocavich@evernorth.com' user,'ab8ad40a8125b991' id,'warehouse' type),
+  ('Shared Warehouse Pro' name,'alexander.Metrocavich@evernorth.com' user,'32fa3d9c5b4ab3d2' id,'warehouse' type),
+  ('Shared Warehouse Pro' name,'alexander.Metrocavich@evernorth.com' user,'cfc43aed2fa72e2f' id,'warehouse' type)
+) t1
+LEFT JOIN (
+  SELECT id, user_name
+  FROM usm_{{env}}.platform.users
+  UNION
+  SELECT id, display_name
+  FROM usm_{{env}}.platform.service_principals
+  UNION
+  SELECT application_id, display_name
+  FROM usm_{{env}}.platform.service_principals
+) t2
+ON t1.user = t2.id ;
 
--- All Purpose Compute costs
-apc_costs AS (
-  SELECT
-    COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
-    DATE(u.usage_end_time) AS event_date,
-    'ALL_PURPOSE' AS job_or_query,
-    u.sku_name,
-    NULL AS job_id,
-    NULL AS run_id,
-    NULL AS statement_id,
-    NULL AS client_application,
-    SUM(u.usage_quantity) AS dbus_usage,
-    ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
-    NULL AS executed_by,
-    COALESCE(
-      FIRST(u_disp.display_name, TRUE),
-      FIRST(sp_disp.display_name, TRUE),
-      '_REDACTED_'
-    ) AS job_owner,
-    NULL AS job_status,
-    NULL AS termination_code,
-    COALESCE(j.all_computes_job_count, 0) AS all_computes_job_count,
-    NULL AS job_name,
-    COALESCE(j.jobs_list, ARRAY()) AS jobs_list,
-    u.usage_metadata.cluster_id AS cluster_id,
-    FIRST(c.cluster_name, TRUE) AS cluster_name
-  FROM system.billing.usage u
-    LEFT JOIN platform.account.pricing_by_date pb
-      ON pb.product_code = u.sku_name
-      AND pb.price_date = CURRENT_DATE()
-    LEFT JOIN clusters c
-      ON u.workspace_id = c.workspace_id
-      AND u.usage_metadata.cluster_id = c.cluster_id
-    LEFT JOIN job_metadata j
-      ON u.workspace_id = j.workspace_id
-      AND u.usage_metadata.cluster_id = j.cluster_id
-    LEFT JOIN user_display_names u_disp
-      ON j.creator_id = u_disp.identity
-    LEFT JOIN sp_display_names sp_disp
-      ON j.creator_id = sp_disp.identity
-    LEFT JOIN workspace_mapping wm
-      ON u.workspace_id = wm.workspace_id
-  WHERE
-    u.sku_name LIKE '%ALL_PURPOSE_COMPUTE%'
-    AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
-    AND u.usage_end_time <= CURRENT_DATE()
-    AND u.usage_metadata.cluster_id IS NOT NULL
-  GROUP BY
-    COALESCE(wm.workspace_name, u.workspace_id),
-    DATE(u.usage_end_time),
-    u.usage_metadata.cluster_id,
-    j.all_computes_job_count,
-    j.jobs_list,
-    j.creator_id,
-    u.sku_name
-),
+-- index by id
+OPTIMIZE usm_{{env}}.platform.creation_events;
 
--- Job Compute costs
-job_costs AS (
-  SELECT
-    COALESCE(wm.workspace_name, u.workspace_id) AS workspace_name,
-    DATE(u.usage_end_time) AS event_date,
-    'JOBS' AS job_or_query,
-    u.sku_name,
-    u.usage_metadata.job_id AS job_id,
-    u.usage_metadata.run_id AS run_id,
-    NULL AS statement_id,
-    NULL AS client_application,
-    SUM(u.usage_quantity) AS dbus_usage,
-    ROUND(SUM(u.usage_quantity * pb.discount_price), 2) AS cost_usd,
-    u.usage_metadata.run_as AS executed_by,
-    COALESCE(
-      FIRST(u_disp.display_name, TRUE),
-      FIRST(sp_disp.display_name, TRUE),
-      '_REDACTED_'
-    ) AS job_owner,
-    FIRST(u.usage_metadata.status, TRUE) AS job_status,
-    FIRST(u.usage_metadata.termination_code, TRUE) AS termination_code,
-    NULL AS all_computes_job_count,
-    FIRST(u.usage_metadata.job_name, TRUE) AS job_name,
-    NULL AS jobs_list,
-    NULL AS cluster_id,
-    NULL AS cluster_name
-  FROM system.billing.usage u
-    LEFT JOIN platform.account.pricing_by_date pb
-      ON pb.product_code = u.sku_name
-      AND pb.price_date = CURRENT_DATE()
-    LEFT JOIN workspace_mapping wm
-      ON u.workspace_id = wm.workspace_id
-    LEFT JOIN user_display_names u_disp
-      ON u.usage_metadata.run_as = u_disp.identity
-    LEFT JOIN sp_display_names sp_disp
-      ON u.usage_metadata.run_as = sp_disp.identity
-  WHERE
-    u.sku_name LIKE '%JOB_COMPUTE%'
-    AND u.usage_start_time >= DATEADD(DAY, -365, CURRENT_DATE)
-    AND u.usage_end_time <= CURRENT_DATE()
-  GROUP BY
-    COALESCE(wm.workspace_name, u.workspace_id),
-    DATE(u.usage_end_time),
-    u.usage_metadata.job_id,
-    u.usage_metadata.run_id,
-    u.usage_metadata.run_as,
-    u.sku_name
-)
+-- add a unique id to each billing row that we can group by on
+-- this is sweet because jobs have unique cluster ids too as well as general purpose clusters
+CREATE OR REPLACE TABLE usm_{{env}}.platform.billing_usage AS
+SELECT * ,
+CASE
+  WHEN usage_metadata.cluster_id IS NOT NULL THEN concat("cluster-", usage_metadata.cluster_id)
+  WHEN usage_metadata.warehouse_id IS NOT NULL THEN concat("warehouse-",usage_metadata.warehouse_id)
+  WHEN usage_metadata.job_id IS NOT NULL THEN concat("job-",usage_metadata.job_id)
+  ELSE NULL
+END id
+FROM `system`.billing.usage;
 
-SELECT * FROM sql_costs
-UNION ALL
-SELECT * FROM apc_costs
-UNION ALL
-SELECT * FROM job_costs;
+-- index by this id
+OPTIMIZE usm_{{env}}.platform.billing_usage;
+
+-- now join the billing rows with creation events so we know who made them
+-- we left join because we do not want to lose any billing rows if we have missing creation events
+CREATE OR REPLACE TABLE usm_{{env}}.platform.billing_usage_with_audit_info AS
+SELECT *
+FROM usm_{{env}}.platform.billing_usage
+LEFT JOIN usm_{{env}}.platform.creation_events
+USING(id);
+
+-- now join the billing and creation events with the prices to know what price to the dbus were
+CREATE OR REPLACE TABLE usm_{{env}}.platform.billing_usage_with_audit_info_and_listing_prices AS (
+  SELECT l.*, r.pricing
+  FROM usm_{{env}}.platform.billing_usage_with_audit_info l
+  LEFT JOIN (
+    SELECT
+      account_id,
+      price_start_time,
+      price_end_time,
+      sku_name,
+      cloud,
+      currency_code,
+      usage_unit,
+      struct(
+        CASE
+          WHEN sku_name
+          like 'ENTERPRISE_ALL_PURPOSE_COMPUTE%'
+          THEN pricing.default
+          * (1-0.4462)
+
+          WHEN sku_name
+          like 'ENTERPRISE_JOBS_COMPUTE%'
+          THEN pricing.default
+          * (1-0.60)
+
+          WHEN sku_name
+          like 'ENTERPRISE_SQL%'
+          THEN pricing.default
+          * (1-0.15)
+
+          ELSE pricing.default
+
+        END
+      as default
+      )
+      as pricing
+      FROM system.billing.list_prices
+      WHERE sku_name
+      like 'ENTERPRISE%'
+  ) as r USING(sku_name)
+);
+
+
+
+CREATE or REPLACE TABLE usm_{{env}}.platform.leaderboard_pre AS
+  SELECT CASE workspace_id
+    WHEN '4315244962041036'	THEN 'intl-euro-test'
+    WHEN '2526242183754071'	THEN 'intl-euro-dev'
+    WHEN '903937390948931' 	THEN 'hs-bdes-test'
+    WHEN '2527997857503871'	THEN 'hs-bdes-dev'
+    WHEN '5629214838322243' THEN 'hs-bdes-prod'
+    WHEN '4009948445792575'	THEN 'brighter-cigna-databricks-v2'
+    WHEN '8759791729654491'	THEN 'edp-databricks-sbx'
+    WHEN '515946335708587'	THEN 'mlcoe-dbx-dev'
+    WHEN '5425976998483154'	THEN 'mlcoe-dbx-prod'
+    WHEN '295062747499580'	THEN 'hs-poc'
+    WHEN '922310190196067'	THEN 'sae-databricks-prod'
+    WHEN '495694519135107'	THEN 'digexp-databricks-test'
+    WHEN '2467188453237426'	THEN 'mlcoe-dbx-test'
+    WHEN '234172798029718'	THEN 'sae-databricks-dev'
+    WHEN '149802285607479'	THEN 'sae-databricks-test'
+    WHEN '2648649579811016'	THEN 'digexp-databricks-prod'
+    WHEN '495694519135107'	THEN 'digexp-databricks-test'
+    WHEN '1064652275943973'	THEN 'digexp-databricks-dev'
+    WHEN '6031270147106191'	THEN 'edp-databricks-dev'
+    WHEN '142132121706207'	THEN 'edp-databricks-prod'
+    WHEN '626070532816605'	THEN 'edp-databricks-test'
+    ELSE workspace_id
+  END workspace,
+  CASE
+    WHEN usage_metadata.job_id IS NOT NULL THEN 'job'
+    WHEN usage_metadata.cluster_id IS NOT NULL THEN 'cluster'
+    WHEN usage_metadata.warehouse_id IS NOT NULL THEN 'warehouse'
+    ELSE NULL
+  END cost_type,
+  COALESCE(
+    concat('https://en-', workspace, '.cloud.databricks.com/?o=', workspace_id, '#setting/clusters/', usage_metadata.cluster_id, '/configuration' ),
+    concat('https://en-', workspace, '.cloud.databricks.com/sql/warehouses/', usage_metadata.warehouse_id, '?o=', workspace_id),
+    concat('https://en-', workspace, '.cloud.databricks.com/?o=', workspace_id, '#job/', usage_metadata.job_id)
+  ) link,
+  COALESCE(
+    custom_tags['JobName'],
+    custom_tags['job_name'],
+    name
+  ) name,
+  COALESCE(
+    custom_tags['TeamName'],
+    custom_tags['TEAM'],
+    custom_tags['Team'],
+    custom_tags['team']
+  ) team,
+  custom_tags['ServiceNowBA'] business_application,
+  COALESCE(
+    custom_tags['CostCenter'],
+    custom_tags['ClaritySubProjectID']
+  ) expense_center,
+  usage_quantity dbus_used ,
+  usage_metadata.node_type compute_type,
+  usage_metadata,
+  custom_tags,
+  usage_date,
+  sku_name,
+  pricing,
+  date_diff(HOUR, usage_end_time, current_timestamp()) hours_ago,
+  user,
+  CASE
+    WHEN usage_metadata.cluster_id IS NOT NULL THEN concat("cluster-", usage_metadata.cluster_id)
+    WHEN usage_metadata.warehouse_id IS NOT NULL THEN concat("warehouse-", usage_metadata.warehouse_id)
+    WHEN usage_metadata.job_id IS NOT NULL THEN concat("job-", usage_metadata.job_id)
+    ELSE NULL
+  END id
+FROM usm_{{env}}.platform.billing_usage_with_audit_info_and_listing_prices;
+
+CREATE OR REPLACE TABLE usm_{{env}}.platform.leaderboard AS
+SELECT
+workspace,
+id,
+link,
+CASE
+  WHEN user IS NOT NULL THEN user
+  ELSE id
+END user,
+cost_type,
+compute_type,
+sku_name,
+pricing.default,
+name,
+team,
+business_application,
+expense_center,
+usage_date,
+last(hours_ago) hours_ago,
+sum(dbus_used) as dbus_used
+FROM usm_{{env}}.platform.leaderboard_pre
+GROUP BY workspace, id, link, user, cost_type, compute_type, sku_name, pricing, name, team, business_application, expense_center, usage_date;
+
+DROP TABLE usm_{{env}}.platform.creation_events;
+DROP TABLE usm_{{env}}.platform.billing_usage;
+DROP TABLE usm_{{env}}.platform.billing_usage_with_audit_info;
+DROP TABLE usm_{{env}}.platform.leaderboard_pre;
+DROP TABLE usm_{{env}}.platform.billing_usage_with_audit_info_and_listing_prices;
+
+CREATE OR REPLACE TABLE USM_{{env}}.PLATFORM.CLUSTERS AS (
+  -- SELECT THE MOST RECENT RECORD FOR EVERY CLUSTER BY ID
+  WITH ADDED_ROW_NUMBER AS (
+    SELECT *, ROW_NUMBER() OVER(PARTITION BY CLUSTER_ID ORDER BY CHANGE_TIME DESC) AS ROW_NUMBER
+    FROM SYSTEM.COMPUTE.CLUSTERS
+    WHERE DELETE_TIME IS NOT NULL
+  )
+  SELECT CASE workspace_id
+    WHEN '4315244962041036'	THEN 'intl-euro-test'
+    WHEN '2526242183754071'	THEN 'intl-euro-dev'
+    WHEN '903937390948931' 	THEN 'hs-bdes-test'
+    WHEN '2527997857503871'	THEN 'hs-bdes-dev'
+    WHEN '5629214838322243' THEN 'hs-bdes-prod'
+    WHEN '4009948445792575'	THEN 'brighter-cigna-databricks-v2'
+    WHEN '8759791729654491'	THEN 'edp-databricks-sbx'
+    WHEN '515946335708587'	THEN 'mlcoe-dbx-dev'
+    WHEN '5425976998483154'	THEN 'mlcoe-dbx-prod'
+    WHEN '295062747499580'	THEN 'hs-poc'
+    WHEN '922310190196067'	THEN 'sae-databricks-prod'
+    WHEN '495694519135107'	THEN 'digexp-databricks-test'
+    WHEN '2467188453237426'	THEN 'mlcoe-dbx-test'
+    WHEN '234172798029718'	THEN 'sae-databricks-dev'
+    WHEN '149802285607479'	THEN 'sae-databricks-test'
+    WHEN '2648649579811016'	THEN 'digexp-databricks-prod'
+    WHEN '495694519135107'	THEN 'digexp-databricks-test'
+    WHEN '1064652275943973'	THEN 'digexp-databricks-dev'
+    WHEN '6031270147106191'	THEN 'edp-databricks-dev'
+    WHEN '142132121706207'	THEN 'edp-databricks-prod'
+    WHEN '626070532816605'	THEN 'edp-databricks-test'
+    ELSE workspace_id
+  END workspace, *
+  FROM ADDED_ROW_NUMBER
+  WHERE ROW_NUMBER = 1
+
+);
